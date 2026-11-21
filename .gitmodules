@@ -1,0 +1,7 @@
+[submodule "cli"]
+	path = cli
+	url = https://github.com/luke-h-code/mistral-hackathon.git
+	branch = computer-use-mcp
+[submodule "baton"]
+	path = baton
+	url = https://github.com/sneldao/baton.git

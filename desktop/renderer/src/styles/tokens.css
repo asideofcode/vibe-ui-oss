@@ -1,0 +1,181 @@
+/*
+ * Vibe / le-chat-web design tokens (from Vibe.app SPA CSS + vibe-web-theme).
+ * Desktop boots in .dark — same ramps as chat.mistral.ai Code.
+ */
+
+:root {
+  --steel-00: #fff;
+  --steel-50: #f9f9fa;
+  --steel-100: #f1f1f3;
+  --steel-200: #e4e4e7;
+  --steel-300: #ccccd1;
+  --steel-400: #a1a1aa;
+  --steel-500: #6d6d78;
+  --steel-600: #55555e;
+  --steel-700: #3d3d43;
+  --steel-800: #27272b;
+  --steel-900: #1a1a1e;
+  --steel-925: #17171b;
+  --steel-950: #101013;
+  --steel-1000: #09090d;
+
+  --cream-00: #fff;
+  --cream-25: #f8f7f3;
+  --cream-50: #fbfbf8;
+  --cream-100: #f5f4ef;
+  --cream-200: #ebe9e0;
+  --cream-300: #dad9cf;
+  --cream-400: #abaaa1;
+  --cream-500: #928f86;
+  --cream-600: #79776e;
+  --cream-700: #615f57;
+  --cream-800: #484740;
+  --cream-900: #302f2b;
+  --cream-950: #201f1c;
+
+  --orange-50: #fff5ed;
+  --orange-100: #ffdccf;
+  --orange-200: #feccaa;
+  --orange-300: #ff8e61;
+  --orange-400: #ff6529;
+  --orange-500: #fa500f;
+  --orange-600: #de4408;
+  --orange-700: #c23700;
+  --orange-800: #9b2211;
+  --orange-900: #7a2300;
+  --orange-950: #430c07;
+
+  --blue-400: #55b3fb;
+  --green-400: #6cd2a7;
+  --red-400: #f07171;
+
+  --brand-50: var(--orange-50);
+  --brand-100: var(--orange-100);
+  --brand-200: var(--orange-200);
+  --brand-300: var(--orange-300);
+  --brand-400: var(--orange-400);
+  --brand-500: var(--orange-500);
+  --brand-600: var(--orange-600);
+  --brand-700: var(--orange-700);
+  --brand-800: var(--orange-800);
+  --brand-900: var(--orange-900);
+  --brand-950: var(--orange-950);
+
+  --neutral-100: #f5f5f5;
+  --neutral-200: #e5e5e5;
+  --neutral-700: #404040;
+
+  --transparent-dark-2: #00000005;
+  --transparent-dark-4: #0000000a;
+  --transparent-dark-6: #0000000f;
+  --transparent-dark-8: #00000014;
+  --transparent-dark-10: #0000001a;
+  --transparent-dark-15: #00000026;
+  --transparent-dark-20: #0003;
+  --transparent-light-4: #ffffff0a;
+  --transparent-light-6: #ffffff0f;
+  --transparent-light-8: #ffffff14;
+  --transparent-light-10: #ffffff1a;
+  --transparent-light-15: #ffffff26;
+  --transparent-light-65: #ffffffa6;
+
+  --bg-basic-gray-alpha-2: #00000005;
+  --bg-basic-gray-alpha-4: #0000000a;
+  --bg-basic-gray-alpha-6: #0000000f;
+  --bg-basic-gray-alpha-8: #00000014;
+  --bg-basic-gray-alpha-10: #0000001a;
+  --bg-basic-gray-alpha-15: #00000026;
+
+  --font-sans: "ALT Mistral", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  --font-headings: "ALT Mistral", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-card-sm: 8px;
+  --radius-card-md: 12px;
+  --radius-card-lg: 16px;
+  --radius-full: 9999px;
+
+  --sidebar-width: 248px;
+  --sidebar-width-icon: 3rem;
+  --files-width: 300px;
+  --sidebar-transition-duration: 200ms;
+  --sidebar-transition-easing: ease;
+  --app-shell-top-bar-inset-left: 0px;
+  --desktop-sidebar-toggle-left: 88px;
+  --desktop-sidebar-toggle-size: 32px;
+  --desktop-shell-controls-top: 4px;
+  /* 4 chrome buttons × 32px + 3 × 2px gaps (sidebar / back / forward / search) */
+  --desktop-shell-controls-cluster-width: 134px;
+  --desktop-title-bar-height: 40px;
+  --bg-tab-drop-shadow-blur: 1px;
+
+  /* light defaults (unused while html.dark) */
+  --bg-default: var(--cream-00);
+  --bg-subtle: var(--cream-50);
+  --bg-muted: var(--cream-100);
+  --bg-card: var(--cream-00);
+  --bg-card-subtle: #fafafa;
+  --bg-sidebar: var(--cream-25);
+  --bg-sidebar-subtle: var(--bg-basic-gray-alpha-6);
+  --bg-sidebar-tabs: var(--transparent-light-65);
+  --bg-state-soft: var(--transparent-dark-6);
+  --bg-state-soft-hover: var(--transparent-dark-8);
+  --bg-state-soft-press: var(--transparent-dark-10);
+  --bg-state-ghost: transparent;
+  --bg-state-ghost-hover: var(--transparent-dark-4);
+  --bg-state-ghost-press: var(--transparent-dark-8);
+  --bg-basic-orange-accent: var(--orange-500);
+  --bg-tab-inner-shadow: var(--cream-00);
+  --bg-tab-drop-shadow: var(--transparent-dark-6);
+  --secondary-200: var(--neutral-200);
+  --text-default: var(--cream-950);
+  --text-subtle: var(--cream-700);
+  --text-muted: var(--cream-500);
+  --border-default: var(--transparent-dark-10);
+  --brand: var(--brand-500);
+}
+
+.dark {
+  /* Exact Vibe.app spa dark semantics */
+  --bg-default: var(--steel-950);
+  --bg-subtle: var(--steel-900);
+  --bg-muted: var(--steel-800);
+  --bg-card: var(--steel-800);
+  --bg-card-subtle: var(--steel-700);
+  --bg-panel: #141416;
+  --bg-sidebar: var(--steel-925);
+  --bg-sidebar-subtle: var(--steel-1000);
+  --bg-sidebar-tabs: var(--steel-925);
+  --bg-state-soft: var(--transparent-light-8);
+  --bg-state-soft-hover: var(--transparent-light-10);
+  --bg-state-soft-press: var(--transparent-light-15);
+  --bg-state-ghost: transparent;
+  --bg-state-ghost-hover: var(--transparent-light-8);
+  --bg-state-ghost-press: var(--transparent-light-15);
+  --bg-basic-gray-alpha-4: var(--transparent-light-6);
+  --bg-basic-orange-accent: var(--orange-500);
+  --bg-tab-inner-shadow: var(--transparent-light-6);
+  --bg-tab-drop-shadow: var(--transparent-dark-15);
+  --secondary-200: var(--neutral-700);
+  --text-default: var(--steel-00);
+  --text-subtle: var(--steel-300);
+  --text-muted: var(--steel-400);
+  --border-default: var(--transparent-light-10);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --border-sidebar-inset: var(--transparent-dark-6);
+  --brand: var(--brand-500);
+
+  /* chat-input-bar shadow recipe from spa CSS */
+  --shadow-chat-input:
+    0 0 0 1px var(--border-default), 0 1px 2px rgba(0, 0, 0, 0.2),
+    0 6px 16px -6px rgba(0, 0, 0, 0.35), 0 24px 48px -16px rgba(0, 0, 0, 0.4);
+
+  --inset-shadow-segmented-tab:
+    inset 0 var(--bg-tab-drop-shadow-blur) 0 0 var(--bg-tab-inner-shadow),
+    inset 0 calc(-1 * var(--bg-tab-drop-shadow-blur)) 0 0 var(--bg-tab-drop-shadow);
+}

@@ -1,0 +1,40 @@
+{
+  "name": "vibe-ui-oss",
+  "productName": "Vibe UI OSS",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source desktop client for local Mistral Vibe (stdio app-server)",
+  "main": "electron/main.js",
+  "scripts": {
+    "ensure:monaco": "node scripts/ensure-monaco.mjs",
+    "build:ui": "npm run ensure:monaco && vite build",
+    "dev:ui": "npm run ensure:monaco && vite",
+    "ensure:app": "node scripts/ensure-vibe-app.mjs",
+    "start": "npm run build:ui && npm run ensure:app && echo \"Launching Vibe UI OSS…\" && VIBE_UI_CDP_PORT=9333 \".runtime/Vibe UI OSS.app/Contents/MacOS/Electron\" --remote-debugging-port=9333 .",
+    "dev": "npm run start",
+    "test:e2e": "npm run build:ui && playwright test -c e2e/playwright.config.mjs",
+    "test:e2e:ui": "npm run build:ui && playwright test -c e2e/playwright.config.mjs --ui",
+    "test:e2e:report": "playwright show-report e2e/artifacts/report",
+    "postinstall": "playwright install ffmpeg"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
+    "@playwright/test": "^1.55.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^37.2.0",
+    "playwright": "^1.55.0",
+    "vite": "^8.3.8"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "monaco-editor": "^0.57.0",
+    "node-pty": "^1.1.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  }
+}

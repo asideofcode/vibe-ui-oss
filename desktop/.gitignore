@@ -1,0 +1,12 @@
+renderer/dist/
+renderer/public/monaco/
+e2e/artifacts/
+.runtime/
+node_modules/
+.runtime/
+e2e/artifacts/
+renderer/dist/monaco/
+*.log
+.DS_Store
+.tmp-proof/
+research/

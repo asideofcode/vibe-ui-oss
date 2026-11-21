@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.target/
+target/
+
+# Local Electron brand / runtime (rebuilt by make ensure-app)
+desktop/.runtime/
+
+# Build / test junk
+*.log
+.DS_Store
+desktop/e2e/artifacts/
+desktop/renderer/dist/monaco/
+*.webm
+*.trace.zip
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+credentials*.json
+
+# Editor
+.idea/
+.vscode/
+*.swp
+desktop/research/
