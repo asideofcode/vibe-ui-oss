@@ -1,0 +1,1890 @@
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_context_edit.py /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_context_edit.py
+--- /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_context_edit.py	1970-01-01 00:00:00.000000000 +0000
++++ /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_context_edit.py	2026-11-21 16:01:08.233116399 +0000
+@@ -0,0 +1,842 @@
++"""``/context-edit``: one utility model call that rewrites stored history messages.
++
++The operation reads the Session's committed interop history, renders the
++editable user and assistant messages as a numbered transcript, and asks the
++session's active model — as a utility completion, outside any turn, without
++tools — which textual signals need edits. The model answers with a JSON
++object (schema: ConversationContextRepair) whose edits name snippets;
++the Harness verifies the edit targets, applies them to the interop
++history, and replaces the Session's context, like a rewind replaces it with a
++truncated transcript.
++
++The request is deliberately conservative about what is editable: only plain
++text user and assistant messages. Injected context, the generated system
++prompt, images, and assistant messages with tool calls pass through
++untouched, because the model cannot rewrite a tool call without breaking the
++tool result that follows it.
++
++Swapping the editor: ``CONTEXT_EDIT_SYSTEM_PROMPT`` owns the instructions the
++editor model runs under (it may carry ``{{conversation_history}}`` and
++``{{what_to_denoise}}`` placeholders, filled from the session and the slash
++command's arguments) and ``CONTEXT_EDIT_OUTPUT_INSTRUCTIONS`` owns the schema
++of the reply it must produce. ``parse_edits`` verifies that reply. Everything
++else — the transcript, the numbering, the application — is shared plumbing
++that does not change with the prompt.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import dataclasses
++import json
++import logging
++import time
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++from mistralai_vibe_local_harness.protocol import (
++    RustSystemMessage,
++    RustTextContentBlock,
++    RustUserMessage,
++)
++from mistralai_vibe_local_harness.session_protocol import JsonObject
++from mistralai_vibe_local_harness.vibe._completion import report_request_sent
++from mistralai_vibe_local_harness.vibe._credentials import (
++    ProviderAuthRequired,
++    ProviderCredentialSnapshot,
++)
++from mistralai_vibe_local_harness.vibe._projection import (
++    content_is_injected,
++    displayed_user_content,
++)
++from mistralai_vibe_local_harness.vibe._runtime_config import (
++    LocalRuntimeAdapterConfig,
++    ProviderRetry,
++)
++from mistralai_vibe_local_harness.vibe._storage import (
++    InteropAssistantContentPartV1,
++    InteropAssistantMessageV1,
++    InteropUserMessageV1,
++    RustTextContentBlock as StorageTextBlock,
++)
++from mistralai_vibe_local_harness.vibe._utility_completion import (
++    CompletionFn,
++    UtilityCompletionError,
++    execute_utility_completion,
++)
++
++logger = logging.getLogger(__name__)
++
++# The editor model's system prompt. Isolated so a different editor — another
++# wording, another policy — is one constant away. It embeds the conversation
++# under ``{{conversation_history}}`` and the user's complaint under
++# ``{{what_to_denoise}}``; ``render_edit_request`` fills both.
++CONTEXT_EDIT_SYSTEM_PROMPT = r"""# System Prompt: Conversation Context Repair Agent
++
++## Role
++
++You are a **Conversation Context Repair Agent**, responsible for diagnosing and proposing targeted modifications to the conversation history used by an LLM-based assistant or autonomous agent.
++
++The user is having a conversation with the LLM where some of the LLM's responses are outputting some words which don't require to be there. These could be some assumptions that the LLM has made by correctly or incorrectly inferring the user intent. Which is fine, but now the user is facing this issue or getting irritated by the presence of these things or signals in the assistant response.
++
++So here your role is to figure out what signals in the given conversation history are creating this problem and then propose edits to messages of the conversation. These edits could either replace a word, sentence with something else or completely remove or mask out certain words, phrases, sentences. These edits will then be applied programmatically to the original conversations, so the user doesn't face this issue (tbh the issue is because of the autoregressive nature of the LLMs and if we used certain words, or sentences before, the later conversation might take that as a signal and generate w\.r\.t\. it, we kind of just need to find those minimal signals and so replacement can be carried out which doesn't bring the underlying issue, so during your thinking it's always recommended to think about what the issue is and what signals are bringing these issues).
++
++## Conversation History
++
++{{conversation_history}}
++
++## What to Denoise/ or the user issue
++
++{{what_to_denoise}}
++
++## Examples
++
++### Example 1: An Earlier Instruction Influencing Unrelated Responses
++
++**Conversation history:**
++
++- **User:** "Explain this concept like I'm a five-year-old."
++- **Assistant:** "Sure, I'll keep things simple and explain everything in a way a child can understand."
++- **User:** "Now let's discuss the mathematical foundations of neural networks."
++- **Assistant:** "Imagine your brain is like a big box of colourful building blocks!"
++
++**What to denoise:**
++
++"The assistant keeps explaining everything like I'm a child, even when I'm asking technical questions."
++
++**Reason:**
++
++The assistant's earlier statement, "I'll keep things simple and explain everything in a way a child can understand", could be influencing later responses. The wording generalises a request intended for one explanation into a broader conversational preference.
++
++---
++
++### Example 2: An Unnecessary Assumption Repeated Throughout the Conversation
++
++**Conversation history:**
++
++- **User:** "I'm thinking of organising a small event for my colleagues."
++- **Assistant:** "Since you're planning a casual event, let's consider some fun activities."
++- **User:** "We should invite around 40 people."
++- **Assistant:** "For your casual event, we could arrange some group activities."
++- **User:** "What kind of venue should we book?"
++- **Assistant:** "Since it's a casual gathering, a café or an informal space would be ideal."
++
++**What to denoise:**
++
++"The assistant keeps assuming the event is casual and recommending things accordingly. I never said it was casual."
++
++**Reason:**
++
++The word "casual" was introduced by the assistant without confirmation from the user. It subsequently appeared in multiple responses, reinforcing the assumption and influencing recommendations.
++
++---
++
++### Example 3: Repeated Words and Phrases Creating an Unwanted Response Pattern
++
++**Conversation history:**
++
++- **User:** "I'm struggling to understand this topic."
++- **Assistant:** "Don't worry, you're doing great! Let's work through it."
++- **User:** "Can you explain the next part?"
++- **Assistant:** "Absolutely! You're doing great, and this is a great question."
++- **User:** "What happens if we change this variable?"
++- **Assistant:** "Great question! You're doing great. Let's explore that."
++- **User:** "What is the relationship between these two variables?"
++- **Assistant:** "That's another great question! You're doing great."
++
++**What to denoise:**
++
++"The assistant keeps telling me I'm doing great and calling everything a great question. It's getting irritating, and I want it to stop."
++
++**Reason:**
++
++The repeated phrases "You're doing great" and "Great question" appear throughout the assistant's earlier messages. These recurring patterns may influence subsequent token generation and encourage similar phrasing.
++
++The goal is not to introduce additional instructions telling the assistant to stop using those phrases, but to reduce the signals already present in the conversation.
++
++These examples demonstrate different ways contextual signals can influence later responses. The problematic signals may come from the user's messages, the assistant's messages, or patterns repeated across multiple turns."""
++
++CONVERSATION_HISTORY_PLACEHOLDER = "{{conversation_history}}"
++WHAT_TO_DENOISE_PLACEHOLDER = "{{what_to_denoise}}"
++
++# The JSON Schema the editor's reply must conform to - enforced twice: once
++# in the prompt (the model sees it verbatim) and once in ``parse_edits``,
++# which rejects any reply that violates it. ``message_index`` is the
++# ``[number]`` label the transcript numbers; ``replacement_text`` rides
++# ``replace`` and ``mask`` and must be absent for ``remove``.
++CONTEXT_EDIT_REPLY_SCHEMA = r"""
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "title": "ConversationContextRepair",
++  "type": "object",
++  "additionalProperties": false,
++  "required": ["edits"],
++  "properties": {
++    "edits": {
++      "type": "array",
++      "description": "List of proposed edits to the conversation history. Return an empty array if no edits are needed.",
++      "items": {
++        "type": "object",
++        "additionalProperties": false,
++        "required": [
++          "reason",
++          "message_index",
++          "message_type",
++          "operation",
++          "original_text"
++        ],
++        "properties": {
++          "message_index": {
++            "type": "integer",
++            "minimum": 0,
++            "description": "Zero-based index of the message in the conversation history."
++          },
++          "message_type": {
++            "type": "string",
++            "enum": ["assistant", "user"],
++            "description": "Role of the message containing the text to edit."
++          },
++          "operation": {
++            "type": "string",
++            "enum": ["replace", "remove", "mask"],
++            "description": "Operation to perform on the identified text."
++          },
++          "original_text": {
++            "type": "string",
++            "minLength": 1,
++            "description": "Exact word, phrase, or sentence from the original message to edit."
++          },
++          "replacement_text": {
++            "type": "string",
++            "minLength": 1,
++            "description": "New text for replace, or masking text for mask."
++          },
++          "reason": {
++            "type": "string",
++            "description": "Why this textual signal may be contributing to the reported issue."
++          }
++        },
++        "allOf": [
++          {
++            "if": {
++              "properties": {
++                "operation": {
++                  "enum": ["replace", "mask"]
++                }
++              },
++              "required": ["operation"]
++            },
++            "then": {
++              "required": ["replacement_text"]
++            }
++          },
++          {
++            "if": {
++              "properties": {
++                "operation": {
++                  "const": "remove"
++                }
++              },
++              "required": ["operation"]
++            },
++            "then": {
++              "not": {
++                "required": ["replacement_text"]
++              }
++            }
++          }
++        ]
++      }
++    }
++  }
++}
++""".strip()
++
++# The output-format half of the contract, sent as the user message: the
++# system prompt names the task, this names the shape of the answer.
++# ``message_index`` names the message's ``[number]`` label in the transcript.
++CONTEXT_EDIT_OUTPUT_INSTRUCTIONS = (
++    "Decide which textual signals in the numbered transcript need edits. "
++    "Respond with a single JSON object that conforms to the schema below, "
++    "wrapped in <edits></edits> tags and nothing else, for example:\n"
++    "\n"
++    "<edits>\n"
++    '  {"edits": [\n'
++    '    {"reason": "the phrase steers later replies wrong", '
++    '"message_index": 0, "message_type": "assistant", "operation": "replace", '
++    '"original_text": "the phrase to change", '
++    '"replacement_text": "the phrase to use instead"},\n'
++    '    {"reason": "the phrase steers later replies wrong", '
++    '"message_index": 2, "message_type": "user", "operation": "remove", '
++    '"original_text": "the phrase to strike"}\n'
++    "  ]}\n"
++    "</edits>\n"
++    "\n"
++    "The reply must conform to this JSON Schema (additional properties are "
++    'rejected; "replacement_text" is required for "replace" and "mask" and '
++    'forbidden for "remove"; every "original_text" must appear exactly in '
++    "the named message):\n"
++    "\n"
++    f"{CONTEXT_EDIT_REPLY_SCHEMA}\n"
++    "\n"
++    '"message_index" is the message\'s [number] label from the transcript '
++    'and "message_type" its role. Prefer several small edits over one '
++    "whole-message rewrite: replace or mask just the signal, and keep "
++    'surrounding wording intact. Output an empty "edits" array when no edit '
++    "is needed."
++)
++
++EDITS_OPEN = "<edits>"
++EDITS_CLOSE = "</edits>"
++
++TRANSCRIPT_OPEN = "<conversation_transcript>"
++TRANSCRIPT_CLOSE = "</conversation_transcript>"
++EDIT_INSTRUCTIONS_OPEN = "<edit_instructions>"
++EDIT_INSTRUCTIONS_CLOSE = "</edit_instructions>"
++
++DEFAULT_EDIT_INSTRUCTIONS = (
++    "Clean up the context so the conversation continues effectively."
++)
++
++# The edit request returns JSON, not prose: generous, but bounded.
++EDIT_MAX_TOKENS = 32_768
++EDIT_TIMEOUT_SECONDS = 120.0
++
++
++class ContextEditError(RuntimeError):
++    """A context edit that cannot run, or a reply that cannot be applied.
++
++    The message is user-facing: the ACP command shows it as the reply to the
++    slash command. ``unchanged`` says the Session's history was left as it
++    was, which is every failure mode here — no edit is applied unless every
++    edit verifies.
++    """
++
++    def __init__(self, message: str) -> None:
++        super().__init__(message)
++        self.unchanged = True
++
++
++@dataclass(frozen=True, slots=True)
++class ContextEdit:
++    """One edit the editor model predicted, verified against the transcript.
++
++    Mirrors one item of the reply schema's ``edits`` array: a snippet-level
++    operation on one editable message, not a whole-message rewrite —
++    ``original_text`` is the exact text to touch, and ``replacement_text``
++    rides ``replace`` and ``mask``.
++    """
++
++    message_index: int
++    message_type: str  # "assistant" or "user"
++    operation: str  # "replace", "remove", or "mask"
++    original_text: str
++    replacement_text: str | None = None
++    reason: str = ""
++
++    def report(self) -> JsonObject:
++        return {
++            "message_index": self.message_index,
++            "message_type": self.message_type,
++            "operation": self.operation,
++            "original_text": self.original_text,
++            "replacement_text": self.replacement_text,
++            "reason": self.reason,
++        }
++
++@dataclass(frozen=True, slots=True)
++class EditableMessage:
++    """The position of an editable message: where it sits in both views.
++
++    ``position`` indexes the interop history; ``number`` is the transcript
++    number the model's edits name. The public projection entry that renders
++    the message is patched separately, by matching ordinals.
++    """
++
++    position: int
++    number: int
++    text: str
++    role: str
++
++
++def editable_text(message: InteropHistoryMessageV1) -> str | None:
++    """The message's full text when it is editable, or ``None``.
++
++    Editable: a user message whose displayed form is exactly one text block,
++    or an assistant message whose only part is a text block. Anything else —
++    injected context, system messages, tool calls, images, multi-block
++    messages — is outside the editor's reach.
++
++    The user judgement rides the same ``displayed_user_content`` view the
++    public projection renders, so a message the projection counts is the
++    one the interop history counts. Injected context counts on neither
++    side: the projection never publishes it.
++    """
++    if isinstance(message, InteropUserMessageV1):
++        if content_is_injected(message.content):
++            return None
++        displayed = displayed_user_content(message.content)
++        if len(displayed) != 1:
++            return None
++        block = displayed[0]
++        if getattr(block, "type", None) != "text":
++            return None
++        return block.text
++    if isinstance(message, InteropAssistantMessageV1):
++        if len(message.parts) != 1:
++            return None
++        part = message.parts[0]
++        if not isinstance(part, InteropAssistantContentPartV1):
++            return None
++        if getattr(part.content, "type", None) != "text":
++            return None
++        return part.content.text
++    return None
++
++
++def editable_messages(
++    history: Sequence[InteropHistoryMessageV1],
++) -> list[EditableMessage]:
++    """The editable messages, in order, with their transcript numbers."""
++    editable = []
++    number = 0
++    for position, message in enumerate(history):
++        text = editable_text(message)
++        if text is None or not text.strip():
++            continue
++        role = "user" if isinstance(message, InteropUserMessageV1) else "assistant"
++        editable.append(
++            EditableMessage(position=position, number=number, text=text, role=role)
++        )
++        number += 1
++    return editable
++
++
++def build_transcript(history: Sequence[InteropHistoryMessageV1]) -> str:
++    """The numbered transcript the editor model reads."""
++    lines = [
++        f"[{message.number}] {'User' if message.role == 'user' else 'Assistant'}:"
++        f" {message.text}"
++        for message in editable_messages(history)
++    ]
++    return "\n".join(lines)
++
++
++def build_request(transcript: str, instructions: str) -> str:
++    """The user message for a system prompt that carries no placeholders."""
++    goal = instructions.strip() or DEFAULT_EDIT_INSTRUCTIONS
++    return (
++        f"{TRANSCRIPT_OPEN}\n{transcript}\n{TRANSCRIPT_CLOSE}\n\n"
++        f"{EDIT_INSTRUCTIONS_OPEN}\n{goal}\n{EDIT_INSTRUCTIONS_CLOSE}\n\n"
++        f"{CONTEXT_EDIT_OUTPUT_INSTRUCTIONS}"
++    )
++
++
++def render_edit_request(transcript: str, instructions: str) -> tuple[str, str]:
++    """The (system, user) messages of the edit completion.
++
++    A prompt with the placeholders gets the transcript and the user's
++    instructions substituted in place; the user message then only carries the
++    output contract. A prompt without them keeps its text whole and gets the
++    transcript and instructions in the user message instead, so a swapped
++    prompt shapes the request without breaking it.
++    """
++    goal = instructions.strip() or DEFAULT_EDIT_INSTRUCTIONS
++    system = CONTEXT_EDIT_SYSTEM_PROMPT
++    parts: list[str] = []
++    if CONVERSATION_HISTORY_PLACEHOLDER in system:
++        system = system.replace(CONVERSATION_HISTORY_PLACEHOLDER, transcript)
++    else:
++        parts.append(f"{TRANSCRIPT_OPEN}\n{transcript}\n{TRANSCRIPT_CLOSE}")
++    if WHAT_TO_DENOISE_PLACEHOLDER in system:
++        system = system.replace(WHAT_TO_DENOISE_PLACEHOLDER, goal)
++    else:
++        parts.append(f"{EDIT_INSTRUCTIONS_OPEN}\n{goal}\n{EDIT_INSTRUCTIONS_CLOSE}")
++    parts.append(CONTEXT_EDIT_OUTPUT_INSTRUCTIONS)
++    return system, "\n\n".join(parts)
++
++
++def parse_edits(output: str) -> list[ContextEdit]:
++    """Parse and verify the editor model's reply into its edits.
++
++    The reply must conform to ``CONTEXT_EDIT_REPLY_SCHEMA``: a JSON object
++    with an ``edits`` array (a bare array is tolerated), wrapped in
++    ``<edits>`` tags or a JSON code fence. Every edit is checked against
++    the schema's rules — required fields, the enums, ``additionalProperties:
++    false``, and ``replacement_text``'s presence for ``replace``/``mask``
++    and absence for ``remove`` — and any violation fails the whole reply,
++    which closes the edit with the history untouched.
++    """
++    payload = output.strip()
++    if EDITS_OPEN in payload and EDITS_CLOSE in payload:
++        start = payload.index(EDITS_OPEN) + len(EDITS_OPEN)
++        end = payload.index(EDITS_CLOSE)
++        payload = payload[start:end].strip()
++    if not payload:
++        return []
++    if payload.startswith("```"):
++        payload = payload.split("\n", 1)[-1]
++        payload = payload.rsplit("```", 1)[0].strip()
++    try:
++        values = json.loads(payload)
++    except json.JSONDecodeError as error:
++        raise ContextEditError(
++            f"The edit reply was not valid JSON: {error}"
++        ) from error
++    if isinstance(values, dict):
++        values = values.get("edits")
++        if values is None:
++            raise ContextEditError(
++                'The edit reply must carry an "edits" array.'
++            )
++    if not isinstance(values, list):
++        raise ContextEditError(
++            'The edit reply must carry an "edits" array.'
++        )
++    allowed = {
++        "reason",
++        "message_index",
++        "message_type",
++        "operation",
++        "original_text",
++        "replacement_text",
++    }
++    edits: list[ContextEdit] = []
++    for value in values:
++        if not isinstance(value, dict):
++            raise ContextEditError("Each edit must be a JSON object.")
++        unknown = set(value) - allowed
++        if unknown:
++            raise ContextEditError(
++                "An edit carries a property the schema does not allow: "
++                f"{sorted(unknown)[0]!r}."
++            )
++        for field in (
++            "reason",
++            "message_index",
++            "message_type",
++            "operation",
++            "original_text",
++        ):
++            if field not in value:
++                raise ContextEditError(
++                    f"An edit is missing its {field!r} field."
++                )
++        index = value["message_index"]
++        message_type = value["message_type"]
++        operation = value["operation"]
++        original = value["original_text"]
++        reason = value["reason"]
++        replacement = value.get("replacement_text")
++        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
++            raise ContextEditError(
++                f"An edit names a message_index that is not a number: "
++                f"{index!r}"
++            )
++        if message_type not in ("assistant", "user"):
++            raise ContextEditError(
++                "An edit names a message_type that is neither "
++                f'"assistant" nor "user": {message_type!r}'
++            )
++        if operation not in ("replace", "remove", "mask"):
++            raise ContextEditError(
++                'An edit names an operation that is not "replace", "remove" '
++                f'or "mask": {operation!r}'
++            )
++        if not isinstance(original, str) or not original:
++            raise ContextEditError(
++                "An edit names empty or non-textual original_text."
++            )
++        if not isinstance(reason, str):
++            raise ContextEditError("An edit's reason must be text.")
++        if operation in ("replace", "mask"):
++            if not isinstance(replacement, str) or not replacement:
++                raise ContextEditError(
++                    f"A {operation} edit must carry replacement_text."
++                )
++        elif replacement is not None:
++            raise ContextEditError(
++                "A remove edit must not carry replacement_text."
++            )
++        edits.append(
++            ContextEdit(
++                message_index=index,
++                message_type=message_type,
++                operation=operation,
++                original_text=original,
++                replacement_text=replacement,
++                reason=reason,
++            )
++        )
++    return edits
++
++
++def edited_texts(
++    history: Sequence[InteropHistoryMessageV1], edits: Sequence[ContextEdit]
++) -> dict[int, str]:
++    """The editable messages' numbers mapped to their post-edit full text.
++
++    Every edit is a snippet operation on one message's current text, and
++    they apply in the model's order — so two edits to one message compose.
++    Any failed edit — a number the transcript never assigned, a role
++    mismatch, an ``original_text`` the message does not carry, or an edit
++    that would empty a message — raises ``ContextEditError``, which the
++    callers turn into an untouched history.
++    """
++    editable = editable_messages(history)
++    texts = {message.number: message.text for message in editable}
++    roles = {message.number: message.role for message in editable}
++    for edit in edits:
++        name = f"message {edit.message_index}"
++        if edit.message_index not in texts:
++            raise ContextEditError(
++                f"Edit names {name}, which is not an editable message."
++            )
++        if roles[edit.message_index] != edit.message_type:
++            raise ContextEditError(
++                f"Edit names {name} as {edit.message_type}, but the message's "
++                f"role is {roles[edit.message_index]}."
++            )
++        current = texts[edit.message_index]
++        if edit.original_text not in current:
++            raise ContextEditError(
++                f"Edit names text that message {edit.message_index} does not "
++                "contain, so it cannot be applied safely."
++            )
++        if edit.operation in ("replace", "mask"):
++            assert edit.replacement_text is not None
++            updated = current.replace(
++                edit.original_text, edit.replacement_text, 1
++            )
++        else:
++            updated = current.replace(edit.original_text, "", 1)
++            # Splicing a snippet out can leave doubled spaces behind; one
++            # gentle pass keeps the message readable without touching any
++            # other wording.
++            while "  " in updated:
++                updated = updated.replace("  ", " ")
++        if not updated.strip():
++            raise ContextEditError(
++                f"Edit would leave message {edit.message_index} empty."
++            )
++        texts[edit.message_index] = updated
++    return texts
++
++
++def apply_edits(
++    history: Sequence[InteropHistoryMessageV1], edits: Sequence[ContextEdit]
++) -> list[InteropHistoryMessageV1]:
++    """The history with every verified edit applied, in place by position.
++
++    Edits never drop or reorder messages: ``replace`` and ``mask`` swap the
++    named snippet for its replacement, ``remove`` splices the snippet out,
++    and every position survives. Raises ``ContextEditError`` — leaving the
++    history untouched — when an edit does not verify.
++    """
++    texts = edited_texts(history, edits)
++    edited = list(history)
++    for message in editable_messages(history):
++        new_text = texts.get(message.number)
++        if new_text is None or new_text == message.text:
++            continue
++        stored = edited[message.position]
++        if isinstance(stored, InteropUserMessageV1):
++            edited[message.position] = stored.model_copy(
++                update={"content": [StorageTextBlock(type="text", text=new_text)]}
++            )
++        elif isinstance(stored, InteropAssistantMessageV1):
++            edited[message.position] = stored.model_copy(
++                update={
++                    "parts": [
++                        InteropAssistantContentPartV1(
++                            type="content",
++                            content=StorageTextBlock(type="text", text=new_text),
++                        )
++                    ]
++                }
++            )
++        else:  # pragma: no cover - editable_messages only numbers these two.
++            raise ContextEditError("An edit targeted a non-editable message.")
++    return edited
++
++
++def patch_public_entries(
++    entries: Sequence[JsonObject],
++    history: Sequence[InteropHistoryMessageV1],
++    edits: Sequence[ContextEdit],
++    *,
++    now: int,
++) -> list[JsonObject]:
++    """The public history entries with the edits applied to their text.
++
++    The public projection holds the same messages the interop history does,
++    so the same ordinal edits apply — except that a user entry may render
++    ``userDisplayContent`` in place of its text. No entry is dropped:
++    replace, mask, and remove are snippet operations, so every message
++    keeps its place and only its wording changes.
++    """
++    message_spots: dict[int, int] = {}
++    spot = 0
++    for index, entry in enumerate(entries):
++        if not isinstance(entry, dict) or entry.get("type") != "message":
++            continue
++        role = entry.get("role")
++        if role not in ("user", "assistant"):
++            continue
++        if entry.get("generationStatus") != "completed":
++            continue
++        content = entry.get("content")
++        if not isinstance(content, list) or len(content) != 1:
++            continue
++        if not isinstance(content[0], dict) or content[0].get("type") != "text":
++            continue
++        text = content[0].get("text")
++        if not isinstance(text, str) or not text.strip():
++            # editable_messages skips blank interop texts; skip here too so
++            # the two counts stay the same.
++            continue
++        message_spots[spot] = index
++        spot += 1
++    editable = editable_messages(history)
++    if spot != len(editable):
++        raise ContextEditError(
++            "The session's history view does not match its stored transcript, "
++            "so no edit can be applied safely."
++        )
++    texts = edited_texts(history, edits)
++    rewrite: dict[int, str] = {}
++    for message in editable:
++        if message.number not in message_spots:
++            raise ContextEditError(
++                f"Edit names message {message.number}, which is not an "
++                "editable message."
++            )
++        new_text = texts[message.number]
++        if new_text != message.text:
++            rewrite[message_spots[message.number]] = new_text
++    patched: list[JsonObject] = []
++    for index, entry in enumerate(entries):
++        if index in rewrite:
++            entry = dict(entry)
++            entry["content"] = [{"type": "text", "text": rewrite[index]}]
++            entry.pop("userDisplayContent", None)
++            entry["updatedAt"] = now
++        patched.append(entry)
++    return patched
++
++
++def edit_marker_entry(
++    session_id: str, edits: Sequence[ContextEdit], *, now: int
++) -> JsonObject:
++    """The public history entry that marks a context edit, like a rewind's."""
++    return {
++        "type": "checkpoint",
++        "id": f"checkpoint-context-edit-{now}",
++        "sessionId": session_id,
++        "turnId": None,
++        "createdAt": now,
++        "updatedAt": now,
++        "generationStatus": "completed",
++        "relatedEntryId": None,
++        "inputEntryId": None,
++        "kind": "custom",
++        "message": "Context edited",
++        "details": {
++            "edits": [edit.report() for edit in edits] if edits else [],
++        },
++    }
++
++
++async def execute_context_edit(
++    *,
++    history: Sequence[InteropHistoryMessageV1],
++    instructions: str,
++    config: LocalRuntimeAdapterConfig,
++    complete: CompletionFn | None = None,
++    timeout_s: float = EDIT_TIMEOUT_SECONDS,
++) -> list[ContextEdit]:
++    """Run the editor completion over ``history`` and return its edits.
++
++    The call rides the session's active model and its credentials, like the
++    smart-approve classifier, and is attributed through the Host telemetry
++    sink under the ``context_edit`` purpose.
++    """
++    transcript = build_transcript(history)
++    if not transcript:
++        raise ContextEditError("No editable messages in the conversation yet.")
++    run_config = dataclasses.replace(
++        config, max_tokens=EDIT_MAX_TOKENS, correlation_id_sink=None
++    )
++    route = config.active_model
++    system_text, user_text = render_edit_request(transcript, instructions)
++    messages = [
++        RustSystemMessage(
++            content=[RustTextContentBlock(text=system_text)]
++        ),
++        RustUserMessage(content=[RustTextContentBlock(text=user_text)]),
++    ]
++    report_request_sent(messages, run_config, route, purpose="context_edit", iteration=0)
++    metadata = (
++        run_config.completion_metadata("context_edit", 0)
++        if run_config.completion_metadata is not None
++        else None
++    )
++    credential = await run_config.credentials.resolve()
++    if isinstance(credential, ProviderAuthRequired):
++        raise ContextEditError(
++            f"The editor completion has no usable credential: {credential.reason}"
++        )
++    assert isinstance(credential, ProviderCredentialSnapshot)
++
++    async def on_retry(retry: ProviderRetry | None) -> None:
++        if retry is not None:
++            logger.info("Context edit completion retrying: %s", retry)
++
++    start = time.perf_counter()
++    try:
++        reply = await asyncio.wait_for(
++            execute_utility_completion(
++                messages,
++                config=run_config,
++                credential=credential,
++                route=route,
++                metadata=metadata,
++                on_retry=on_retry,
++                complete=complete,
++            ),
++            timeout=timeout_s,
++        )
++    except TimeoutError as error:
++        raise ContextEditError(
++            "The edit model did not answer in time; nothing was changed."
++        ) from error
++    except UtilityCompletionError as error:
++        raise ContextEditError(
++            f"The edit model call failed: {error}"
++        ) from error
++    logger.info(
++        "Context edit completion answered in %.1fs with %d characters",
++        time.perf_counter() - start,
++        len(reply.text),
++    )
++    return parse_edits(reply.text)
++
++
++__all__ = [
++    "CONTEXT_EDIT_OUTPUT_INSTRUCTIONS",
++    "CONTEXT_EDIT_REPLY_SCHEMA",
++    "CONTEXT_EDIT_SYSTEM_PROMPT",
++    "ContextEdit",
++    "ContextEditError",
++    "apply_edits",
++    "build_request",
++    "build_transcript",
++    "editable_messages",
++    "editable_text",
++    "edited_texts",
++    "edit_marker_entry",
++    "execute_context_edit",
++    "parse_edits",
++    "patch_public_entries",
++    "render_edit_request",
++]
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_host.py /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_host.py
+--- /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_host.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_host.py	2026-11-21 15:59:55.331116819 +0000
+@@ -86,6 +86,14 @@
+     ConnectorRuntime,
+     plan_connector_snapshot,
+ )
++from mistralai_vibe_local_harness.vibe._context_edit import (
++    ContextEdit,
++    ContextEditError,
++    apply_edits,
++    edit_marker_entry,
++    execute_context_edit,
++    patch_public_entries,
++)
+ from mistralai_vibe_local_harness.vibe._errors import (
+     HarnessChildSessionRequiresParentError,
+     HarnessInvalidMigrationSourceError,
+@@ -1664,6 +1672,71 @@
+         )
+         return session
+ 
++    async def context_edit(
++        self, session_id: str, instructions: str = ""
++    ) -> tuple[UnifiedHarnessSessionBackend, list[ContextEdit]]:
++        """Rewrite the session's stored history under an editor model's edits.
++
++        One utility completion on the session's active model reads the
++        session's editable messages as a numbered transcript and predicts
++        which of them need replacing or removing; the harness verifies each
++        edit, rewrites both the stored history and the public projection to
++        match, and installs the result as the session's new context, the way
++        a rewind installs a truncated one. Message positions survive: only
++        wording changes. A ``ContextEditError`` — or an empty edit list —
++        leaves the session exactly as it was, with no checkpoint taken.
++        """
++        self._guard_open()
++        session_id = self._resolve_unified_session_id(session_id) or session_id
++        session = self._live_session(session_id)
++        if session is None:
++            raise HarnessSessionNotFoundError(session_id)
++        await session._wait_for_pending_turns()
++        runtime = session._runtime_for_host()
++        if isinstance(runtime.identity, SubagentSessionIdentity):
++            raise HarnessChildSessionRequiresParentError(session_id, "context-edited")
++        adapter_config = session.adapter_config
++        if adapter_config is None:
++            raise ContextEditError(
++                "This session has no model configuration, so its context "
++                "cannot be edited automatically."
++            )
++        stored = await runtime.fold_idle_journal()
++        history = self._importable_history(stored, "context_edit")
++        edits = await execute_context_edit(
++            history=history,
++            instructions=instructions,
++            config=adapter_config,
++        )
++        if not edits:
++            return session, []
++        edited_history = apply_edits(history, edits)
++        public = runtime.projection.model_copy(deep=True)
++        now = _now_milliseconds()
++        entries = patch_public_entries(public.history.entries, history, edits, now=now)
++        entries.append(edit_marker_entry(session_id, edits, now=now))
++        projection = public.model_copy(
++            update={
++                "session": public.session.model_copy(
++                    update={"status": IdleSessionStatus(), "updated_at": now}
++                ),
++                "history": public.history.model_copy(update={"entries": entries}),
++                "latest_turn": None,
++            }
++        )
++        checkpoint = _create_checkpoint(
++            session_id,
++            edited_history,
++            runtime.config,
++            attachments_root=self._attachments_root(session_id),
++            keep_interop_metadata=True,
++        )
++        await session.drop_workspace_move()
++        await runtime.replace_quiescent_context(
++            checkpoint=checkpoint, projection=projection
++        )
++        return session, edits
++
+     async def _fork_unsaved_live_session(
+         self,
+         source_session_id: str,
+@@ -4737,7 +4810,8 @@
+ 
+     @staticmethod
+     def _importable_history(
+-        stored: StoredSession, operation: Literal["rewind", "fork"]
++        stored: StoredSession,
++        operation: Literal["rewind", "fork", "context_edit"],
+     ) -> list[InteropHistoryMessageV1]:
+         unsettled = stored.runtime_state.unsettled_work()
+         if not unsettled and not _journal_preserves_interop_history(stored.journal):
+@@ -5709,7 +5783,7 @@
+ 
+ 
+ def _unsettled_session_message(
+-    operation: Literal["rewind", "fork"], unsettled: Sequence[str]
++    operation: Literal["rewind", "fork", "context_edit"], unsettled: Sequence[str]
+ ) -> str:
+     """Tell the user why a rewind or fork has to wait, short enough for a notice.
+ 
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_runtime_config.py /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_runtime_config.py
+--- /tmp/pristine/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_runtime_config.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/harness/runtimes/python/python/mistralai_vibe_local_harness/vibe/_runtime_config.py	2026-11-21 15:59:55.333116819 +0000
+@@ -48,9 +48,12 @@
+ 
+ # ``classify`` and ``title`` name Runtime-issued completions outside Core's LLM
+ # call actions (those stay ``agent`` or ``compaction``): the smart-approve risk
+-# classifier's gate call and the background session title. They ride the same
++# classifier's gate call, the background session title, and the
++# ``/context-edit`` editor completion. They ride the same
+ # host seams so a Host attributes and counts them like any other completion.
+-type CompletionPurpose = Literal["agent", "compaction", "classify", "title"]
++type CompletionPurpose = Literal[
++    "agent", "compaction", "classify", "title", "context_edit"
++]
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/tests/acp/test_context_edit_command.py /home/user/mistral-vibe/tests/acp/test_context_edit_command.py
+--- /tmp/pristine/tests/acp/test_context_edit_command.py	1970-01-01 00:00:00.000000000 +0000
++++ /home/user/mistral-vibe/tests/acp/test_context_edit_command.py	2026-11-21 16:01:20.557116330 +0000
+@@ -0,0 +1,173 @@
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any, cast
++from unittest.mock import AsyncMock, MagicMock
++
++from acp.schema import (
++    AgentMessageChunk,
++    ToolCallProgress,
++    ToolCallStart,
++)
++import pytest
++
++from tests.stubs.fake_client import FakeClient
++from vibe.acp.commands.controller import AcpCommandController
++from vibe.acp.commands.registry import AcpCommandRegistry
++from vibe.acp.exceptions import InternalError
++from vibe.acp.session import AcpSession
++from vibe.app_server.protocol import (
++    AppServerResponseError,
++    ProtocolError,
++    ProtocolErrorCode,
++    SessionContextEditResponse,
++)
++from vibe.app_server.session import AppServerSession
++
++
++def _edit(
++    operation: str = "replace",
++    message_index: int = 0,
++    message_type: str = "assistant",
++    replacement_text: str | None = None,
++) -> SimpleNamespace:
++    """One entry of the response's ``edits`` list, as the controller reads it."""
++    return SimpleNamespace(
++        operation=operation,
++        message_index=message_index,
++        message_type=message_type,
++        original_text="the bothersome phrase",
++        replacement_text=replacement_text,
++        reason="the phrase steers later replies wrong",
++    )
++
++
++def _controller_and_session(
++    *,
++    has_history: bool = False,
++    context_edit: AsyncMock | None = None,
++) -> tuple[AcpCommandController, AcpSession, FakeClient]:
++    client = FakeClient()
++
++    async def send_config_options(_session: AcpSession) -> None:
++        return None
++
++    controller = AcpCommandController(lambda: client, send_config_options)
++    app_server = MagicMock(spec=AppServerSession)
++    app_server.resources = MagicMock()
++    app_server.state.latest_turn = None
++    # The controller only asks whether there is anything to edit; the shape
++    # of the entries it would read does not matter to it.
++    entry: Any = MagicMock()
++    app_server.history = [entry] if has_history else []
++    if context_edit is not None:
++        app_server.context_edit = context_edit
++    session = AcpSession(
++        session_id="session",
++        app_server=cast(AppServerSession, app_server),
++        cwd=Path.cwd(),
++        commands=AcpCommandRegistry(),
++    )
++    return controller, session, client
++
++
++def _tool_call_chapters(
++    client: FakeClient,
++) -> list[tuple[str, ToolCallStart | ToolCallProgress]]:
++    return [
++        (update.update.title, update.update)
++        for update in client._session_updates
++        if isinstance(update.update, ToolCallStart | ToolCallProgress)
++    ]
++
++
++def _agent_messages(client: FakeClient) -> list[str]:
++    return [
++        notification.update.content.text
++        for notification in client._session_updates
++        if isinstance(notification.update, AgentMessageChunk)
++        and hasattr(notification.update.content, "text")
++    ]
++
++
++@pytest.mark.asyncio
++async def test_context_edit_without_history_says_so() -> None:
++    controller, session, client = _controller_and_session()
++
++    await controller.execute(session, "/context-edit", "message-1")
++
++    assert _agent_messages(client) == ["No conversation history to edit yet."]
++
++
++@pytest.mark.asyncio
++async def test_context_edit_reports_the_edits_the_model_applied() -> None:
++    response = cast(
++        SessionContextEditResponse,
++        SimpleNamespace(
++            changed=True,
++            edits=[
++                _edit("replace", replacement_text="a neutral phrasing"),
++                _edit("remove", message_index=2, message_type="user"),
++            ],
++        ),
++    )
++    context_edit = AsyncMock(return_value=response)
++    controller, session, client = _controller_and_session(
++        has_history=True, context_edit=context_edit
++    )
++
++    await controller.execute(session, "/context-edit fix my typos", "m-1")
++
++    context_edit.assert_awaited_once_with("fix my typos")
++    chapters = _tool_call_chapters(client)
++    assert [title for title, _ in chapters] == [
++        "Editing conversation context...",
++        "Edited conversation context",
++    ]
++    progress = cast(ToolCallProgress, chapters[1][1])
++    text = progress.content[0].content.text
++    assert "1 snippet replaced" in text
++    assert "1 snippet removed" in text
++    assert progress.status == "completed"
++
++
++@pytest.mark.asyncio
++async def test_context_edit_with_no_edits_needed_says_the_context_is_unchanged() -> None:
++    response = cast(
++        SessionContextEditResponse, SimpleNamespace(changed=False, edits=[])
++    )
++    context_edit = AsyncMock(return_value=response)
++    controller, session, client = _controller_and_session(
++        has_history=True, context_edit=context_edit
++    )
++
++    await controller.execute(session, "/context-edit", "m-1")
++
++    progress = _tool_call_chapters(client)[-1][1]
++    assert (
++        progress.content[0].content.text
++        == "No messages needed edits; the conversation is unchanged."
++    )
++
++
++@pytest.mark.asyncio
++async def test_context_edit_when_the_backend_refuses_reports_the_failure() -> None:
++    context_edit = AsyncMock(
++        side_effect=AppServerResponseError(
++            ProtocolError(
++                code=ProtocolErrorCode.INVALID_PARAMS,
++                message="The edit reply was not a JSON array.",
++            )
++        )
++    )
++    controller, session, client = _controller_and_session(
++        has_history=True, context_edit=context_edit
++    )
++
++    with pytest.raises(InternalError):
++        await controller.execute(session, "/context-edit", "m-1")
++
++    progress = _tool_call_chapters(client)[-1][1]
++    assert progress.status == "failed"
++    assert progress.raw_output == "The edit reply was not a JSON array."
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/tests/app_server/test_session_backend_port.py /home/user/mistral-vibe/tests/app_server/test_session_backend_port.py
+--- /tmp/pristine/tests/app_server/test_session_backend_port.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/tests/app_server/test_session_backend_port.py	2026-11-21 15:59:55.335116819 +0000
+@@ -35,6 +35,7 @@
+ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> None:
+     assert _protocol_members(SessionBackend) == {
+         "compact",
++        "context_edit",
+         "enqueue_turn",
+         "guard_request",
+         "inject_context",
+@@ -71,6 +72,7 @@
+         "session/approvalPolicy/update",
+         "session/compact",
+         "session/context/inject",
++        "session/contextEdit",
+         "session/settings/update",
+         "session/turn/enqueue",
+         "session/turn/queue/edit/abandon",
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/acp/commands/controller.py /home/user/mistral-vibe/vibe/acp/commands/controller.py
+--- /tmp/pristine/vibe/acp/commands/controller.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/acp/commands/controller.py	2026-11-21 16:01:18.049116344 +0000
+@@ -22,6 +22,9 @@
+     compact_end_update,
+     compact_error_update,
+     compact_start_update,
++    context_edit_end_update,
++    context_edit_error_update,
++    context_edit_start_update,
+     get_proxy_help_text,
+ )
+ from vibe.app_server.models import PublicTurn, PublicTurnStatus, TurnErrorCode
+@@ -109,6 +112,8 @@
+                 response = await self._help(session)
+             case AcpCommandKind.COMPACT:
+                 response = await self._compact(session, arguments)
++            case AcpCommandKind.CONTEXT_EDIT:
++                response = await self._context_edit(session, arguments)
+             case AcpCommandKind.RELOAD:
+                 response = await self._reload(session)
+             case AcpCommandKind.LOG:
+@@ -199,6 +204,48 @@
+         )
+         return PromptResponse(stop_reason="end_turn")
+ 
++    async def _context_edit(
++        self, session: AcpSession, instructions: str
++    ) -> PromptResponse:
++        app_server = session.app_server
++        if not app_server.history:
++            return await self._reply(session, "No conversation history to edit yet.")
++        call_id = str(uuid4())
++        client = self._client()
++        await client.session_update(
++            session_id=session.id, update=context_edit_start_update(call_id)
++        )
++        try:
++            response = await app_server.context_edit(instructions)
++        except AppServerResponseError as exc:
++            error = from_app_server_error(exc.error)
++            await client.session_update(
++                session_id=session.id,
++                update=context_edit_error_update(call_id, exc.error.message),
++            )
++            raise error from exc
++        if not response.changed:
++            message = "No messages needed edits; the conversation is unchanged."
++        else:
++            counts = {"replace": 0, "mask": 0, "remove": 0}
++            for edit in response.edits:
++                counts[edit.operation] = counts.get(edit.operation, 0) + 1
++            summary = [
++                f"{count} snippet{'s' if count != 1 else ''} {operation}"
++                f"{'d' if operation in ('replace', 'mask') else ''}"
++                for operation, count in counts.items()
++                if count
++            ]
++            message = (
++                "Conversation context edited: " + ", ".join(summary) + ". "
++                "Message positions were preserved."
++            )
++        await client.session_update(
++            session_id=session.id,
++            update=context_edit_end_update(call_id, message),
++        )
++        return PromptResponse(stop_reason="end_turn")
++
+     async def _reload(self, session: AcpSession) -> PromptResponse:
+         try:
+             await session.app_server.resources.config.reload(reload_runtime=True)
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/acp/commands/registry.py /home/user/mistral-vibe/vibe/acp/commands/registry.py
+--- /tmp/pristine/vibe/acp/commands/registry.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/acp/commands/registry.py	2026-11-21 15:59:55.337116819 +0000
+@@ -7,6 +7,7 @@
+ class AcpCommandKind(StrEnum):
+     HELP = auto()
+     COMPACT = auto()
++    CONTEXT_EDIT = auto()
+     RELOAD = auto()
+     LOG = auto()
+     MCP = auto()
+@@ -60,6 +61,16 @@
+             kind=AcpCommandKind.COMPACT,
+             input_hint="Optional instructions to guide the compaction summary",
+         ),
++        "context-edit": AcpCommand(
++            name="context-edit",
++            description=(
++                "Rewrite earlier messages in the conversation context. A model "
++                "reads the transcript and replaces or removes messages that "
++                "need it; positions are preserved"
++            ),
++            kind=AcpCommandKind.CONTEXT_EDIT,
++            input_hint="Optional instructions for what the edit should change",
++        ),
+         "reload": AcpCommand(
+             name="reload",
+             description="Reload configuration, agent instructions, and skills from disk",
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/acp/utils.py /home/user/mistral-vibe/vibe/acp/utils.py
+--- /tmp/pristine/vibe/acp/utils.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/acp/utils.py	2026-11-21 15:59:55.338116819 +0000
+@@ -259,6 +259,52 @@
+     )
+ 
+ 
++def context_edit_start_update(tool_call_id: str) -> ToolCallStart:
++    return ToolCallStart(
++        session_update="tool_call",
++        tool_call_id=tool_call_id,
++        title="Editing conversation context...",
++        kind="other",
++        status="in_progress",
++        content=[
++            ContentToolCallContent(
++                type="content",
++                content=TextContentBlock(
++                    type="text",
++                    text=(
++                        "Asking the session's model which messages need edits. "
++                        "This may take some time..."
++                    ),
++                ),
++            )
++        ],
++    )
++
++
++def context_edit_end_update(tool_call_id: str, message: str) -> ToolCallProgress:
++    return ToolCallProgress(
++        session_update="tool_call_update",
++        tool_call_id=tool_call_id,
++        title="Edited conversation context",
++        status="completed",
++        content=[
++            ContentToolCallContent(
++                type="content", content=TextContentBlock(type="text", text=message)
++            )
++        ],
++    )
++
++
++def context_edit_error_update(tool_call_id: str, message: str) -> ToolCallProgress:
++    return ToolCallProgress(
++        session_update="tool_call_update",
++        tool_call_id=tool_call_id,
++        title="Context edit failed",
++        status="failed",
++        raw_output=message,
++    )
++
++
+ def get_proxy_help_text(settings: ProxySettingsView) -> str:
+     lines = [
+         "## Proxy Configuration",
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/_session_api_path.py /home/user/mistral-vibe/vibe/app_server/_session_api_path.py
+--- /tmp/pristine/vibe/app_server/_session_api_path.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/_session_api_path.py	2026-11-21 15:59:55.339116819 +0000
+@@ -437,6 +437,14 @@
+                 }
+             )
+ 
++    async def reset_after_context_edit(self) -> None:
++        """Read the root again: stored messages were rewritten in place.
++
++        The same re-read a rewind does — any Session API path that mirrors the
++        session must not keep patching against the pre-edit transcript.
++        """
++        await self.reset_after_rewind()
++
+     def release_events(self) -> None:
+         """Let the stream go on, as the adapter shuts down."""
+         self._events_released.set()
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/_session_backend_port.py /home/user/mistral-vibe/vibe/app_server/_session_backend_port.py
+--- /tmp/pristine/vibe/app_server/_session_backend_port.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/_session_backend_port.py	2026-11-21 15:59:55.340116819 +0000
+@@ -47,6 +47,8 @@
+     SessionCompactParams,
+     SessionCompactResponse,
+     SessionContinueParams,
++    SessionContextEditParams,
++    SessionContextEditResponse,
+     SessionDeleteParams,
+     SessionForkParams,
+     SessionForkResponse,
+@@ -534,6 +536,10 @@
+         self, params: SessionCompactParams
+     ) -> SessionBackendResult[SessionCompactResponse]: ...
+ 
++    async def context_edit(
++        self, params: SessionContextEditParams
++    ) -> SessionBackendResult[SessionContextEditResponse]: ...
++
+     async def shutdown(self) -> None: ...
+ 
+ 
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/_session_resources.py /home/user/mistral-vibe/vibe/app_server/_session_resources.py
+--- /tmp/pristine/vibe/app_server/_session_resources.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/_session_resources.py	2026-11-21 15:59:55.341116819 +0000
+@@ -55,6 +55,8 @@
+     ReviewTurnDiffResponse,
+     SessionCompactParams,
+     SessionCompactResponse,
++    SessionContextEditParams,
++    SessionContextEditResponse,
+     SessionDeleteParams,
+     SessionForkParams,
+     SessionForkResponse,
+@@ -403,6 +405,23 @@
+         self._connection.mark_session_attached()
+         return response.summary
+ 
++    async def context_edit(self, instructions: str = "") -> SessionContextEditResponse:
++        client = await self._connection.connect()
++        response = validate_wire(
++            SessionContextEditResponse,
++            await client.request(
++                "session/contextEdit",
++                SessionContextEditParams(
++                    session_id=self._state.session_id,
++                    instructions=instructions,
++                ),
++            ),
++        )
++        self._state.projection.replace_state(response.state)
++        self._state.session_log = response.session_log
++        self._connection.mark_session_attached()
++        return response
++
+     async def rewind_has_file_changes(self, entry_id: str) -> bool:
+         return bool(await self.rewind_preview(entry_id))
+ 
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/_unified_harness_backend_adapter.py /home/user/mistral-vibe/vibe/app_server/_unified_harness_backend_adapter.py
+--- /tmp/pristine/vibe/app_server/_unified_harness_backend_adapter.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/_unified_harness_backend_adapter.py	2026-11-21 16:01:14.893116363 +0000
+@@ -121,6 +121,7 @@
+     UnifiedHarnessSessionBackend,
+     UnifiedHarnessSessionBackendHost,
+ )
++from mistralai_vibe_local_harness.vibe._context_edit import ContextEditError
+ from mistralai_vibe_local_harness.vibe._foreign_hooks import (
+     HookProcess,
+     HostHookResult,
+@@ -701,6 +702,9 @@
+     SessionCompactParams,
+     SessionCompactResponse,
+     SessionContentBlock,
++    SessionContextEditEntry,
++    SessionContextEditParams,
++    SessionContextEditResponse,
+     SessionContextReadParams,
+     SessionContextReadResponse,
+     SessionContinueParams,
+@@ -15190,6 +15194,69 @@
+             )
+         return entry
+ 
++    async def context_edit(
++        self, params: SessionContextEditParams
++    ) -> SessionBackendResult[SessionContextEditResponse]:
++        """Rewrite the stored history under an editor model's edits, in place.
++
++        One utility completion on the session's active model reads the
++        session's plain-text user and assistant messages as a numbered
++        transcript and predicts which of them need replacing or removing; the
++        Harness verifies each edit against the transcript, installs the
++        rewritten context the way a rewind installs a truncated one, and this
++        reply carries the new state. Message positions survive: only wording
++        changes. A rejected prediction raises and the session is left exactly
++        as it was, no checkpoint taken.
++        """
++        self._require_session(params.session_id)
++        await self._require_settled()
++        if self._host is None:
++            _reject("session/contextEdit")
++        # Let the snapshots see every write of the settled turn before the
++        # editor runs: the transcript it reads is the committed one.
++        await self.flush_events()
++        try:
++            _session, edits = await _harness_call(
++                self._host.context_edit(params.session_id, params.instructions)
++            )
++        except ContextEditError as exc:
++            # A user-facing refusal (no edit applied, nothing changed), not a
++            # broken session: the code matches how an unusable rewind anchor
++            # reads on the wire.
++            raise SessionBackendError(
++                ProtocolErrorCode.INVALID_PARAMS, str(exc)
++            ) from exc
++        # The rewritten context lands in the Core before its events reach the
++        # Client, so the reply must not race them (_rewind has the same rule).
++        await self.flush_events()
++        if self._api_path is not None:
++            await self._api_path.reset_after_context_edit()
++        snapshot = await self.read(
++            SessionReadParams(
++                session_id=self.session_id,
++                history=PageRequest(limit=500),
++                turns=PageRequest(limit=500),
++            )
++        )
++        return SessionBackendResult(
++            response=SessionContextEditResponse(
++                changed=bool(edits),
++                edits=[
++                    SessionContextEditEntry(
++                        message_index=edit.message_index,
++                        message_type=edit.message_type,
++                        operation=edit.operation,
++                        original_text=edit.original_text,
++                        replacement_text=edit.replacement_text,
++                        reason=edit.reason,
++                    )
++                    for edit in edits
++                ],
++                state=snapshot.state,
++                session_log=await self._session_log_summary(),
++            )
++        )
++
+     def announce_on_first_use(self) -> None:
+         """Hold this session's lifecycle telemetry until its first message.
+ 
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/protocol.py /home/user/mistral-vibe/vibe/app_server/protocol.py
+--- /tmp/pristine/vibe/app_server/protocol.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/protocol.py	2026-11-21 16:01:11.679116381 +0000
+@@ -208,6 +208,7 @@
+     "session/continue",
+     "session/context/inject",
+     "session/context/read",
++    "session/contextEdit",
+     "session/delete",
+     "session/fork",
+     "session/history/clear",
+@@ -3751,6 +3752,37 @@
+     state: PublicSessionState
+     session_log: SessionLogSummary
+ 
++
++class SessionContextEditParams(ProtocolModel):
++    session_id: str
++    instructions: str = ""
++
++
++class SessionContextEditEntry(ProtocolModel):
++    """One edit the editor model predicted, applied or reported verbatim.
++
++    Mirrors one item of the ConversationContextRepair schema the editor model
++    answered with. ``message_index`` is the number the numbered transcript
++    named, not a position in the stored history: the reply echoes the model's
++    own numbering, which is the only numbering the caller ever saw.
++    ``replacement_text`` rides ``replace`` and ``mask`` and stays ``None`` for
++    ``remove``, exactly as the schema's conditional requires.
++    """
++
++    message_index: int = Field(ge=0)
++    message_type: Literal["assistant", "user"]
++    operation: Literal["replace", "remove", "mask"]
++    original_text: str = Field(min_length=1)
++    replacement_text: str | None = Field(default=None, min_length=1)
++    reason: str = ""
++
++
++class SessionContextEditResponse(ProtocolModel):
++    changed: bool
++    edits: list[SessionContextEditEntry] = Field(default_factory=list)
++    state: PublicSessionState
++    session_log: SessionLogSummary
++
+ 
+ class EventNotificationParams(ProtocolModel):
+     event_id: int = Field(ge=0, strict=True)
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/server.py /home/user/mistral-vibe/vibe/app_server/server.py
+--- /tmp/pristine/vibe/app_server/server.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/server.py	2026-11-21 15:59:55.354116819 +0000
+@@ -177,6 +177,7 @@
+     SessionCompactParams,
+     SessionContinueParams,
+     SessionContinueResponse,
++    SessionContextEditParams,
+     SessionDeleteParams,
+     SessionForkParams,
+     SessionHandoffParams,
+@@ -316,6 +317,7 @@
+     "session/approvalPolicy/update",
+     "session/compact",
+     "session/context/inject",
++    "session/contextEdit",
+     "session/settings/update",
+     "session/turn/enqueue",
+     "session/turn/queue/edit/abandon",
+@@ -1734,6 +1736,13 @@
+                 after_response=result.after_response,
+                 on_response_abandoned=result.on_response_abandoned,
+             )
++        if method == "session/contextEdit":
++            result = await root.context_edit(
++                validate_wire(SessionContextEditParams, raw_params)
++            )
++            return DispatchResult(
++                result.response, after_response=result.after_response
++            )
+         return None
+ 
+     @staticmethod
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/app_server/session.py /home/user/mistral-vibe/vibe/app_server/session.py
+--- /tmp/pristine/vibe/app_server/session.py	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/app_server/session.py	2026-11-21 15:59:55.356116819 +0000
+@@ -78,6 +78,7 @@
+     ServerRequest,
+     SessionContinueParams,
+     SessionContinueResponse,
++    SessionContextEditResponse,
+     SessionKind,
+     SessionOptions,
+     SessionReadParams,
+@@ -874,6 +875,11 @@
+         await self.resources.refresh()
+         return summary
+ 
++    async def context_edit(self, instructions: str = "") -> SessionContextEditResponse:
++        result = await self.resources.sessions.context_edit(instructions)
++        await self.resources.refresh()
++        return result
++
+     async def clear_history(self) -> None:
+         await self.resources.sessions.clear_history()
+         await self.resources.refresh()
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/commands/commands.rs /home/user/mistral-vibe/vibe/cli-rust/src/commands/commands.rs
+--- /tmp/pristine/vibe/cli-rust/src/commands/commands.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/commands/commands.rs	2026-11-21 15:59:55.357116819 +0000
+@@ -100,6 +100,7 @@
+     )
+     .args("[entries]"),
+     cmd(&["/compact"], "Compact conversation history by summarizing. Optionally pass instructions to guide the summary", false).args("[instructions]"),
++    cmd(&["/context-edit"], "Rewrite or remove earlier messages that steer replies wrong. Optionally say what to change", false).args("[what to change]"),
+     cmd(&["/exit", ":q", ":quit", "exit", "quit"], "Exit the application", true),
+     cmd(&["/status"], "Display agent statistics and model and provider details", true),
+     cmd(&["/context"], "Show what fills the context window (system prompt, skills, conversation)", true),
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/commands/context_edit.rs /home/user/mistral-vibe/vibe/cli-rust/src/commands/context_edit.rs
+--- /tmp/pristine/vibe/cli-rust/src/commands/context_edit.rs	1970-01-01 00:00:00.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/commands/context_edit.rs	2026-11-21 16:01:29.394116279 +0000
+@@ -0,0 +1,193 @@
++//! `/context-edit`: send `session/contextEdit` and rebuild the transcript
++//! from the state the server returns, like a rewind that rewrites wording.
++
++use std::sync::Arc;
++
++use serde_json::{json, Value};
++
++use super::compact::settle_compact;
++use super::event::{dispatch, CommandEvent};
++use super::submission::new_message_id;
++use crate::app::{App, Status};
++use crate::server::{method, Client, PublicSessionState};
++use crate::transcript::local;
++
++/// Start a context edit. Does nothing while a turn is generating or if there
++/// is no conversation history.
++pub fn start_context_edit(app: &mut App, client: &Arc<Client>, value: &str) {
++    if matches!(app.session.status, Status::Generating { .. }) {
++        local::add_command_error(
++            &mut app.view.transcript,
++            &new_message_id(),
++            "Cannot edit context while agent loop is processing. Please wait.",
++        );
++        return;
++    }
++    // Only server rows count as history; local rows are client notices.
++    if app.view.transcript.lines().all(|entry| entry.local) {
++        local::add_command_error(
++            &mut app.view.transcript,
++            &new_message_id(),
++            "No conversation history to edit yet.",
++        );
++        return;
++    }
++    let Some(session_id) = app.session.session_id.clone() else {
++        return;
++    };
++    let instructions = value
++        .split_once(char::is_whitespace)
++        .map(|(_, rest)| rest.trim().to_owned())
++        .filter(|s| !s.is_empty())
++        .unwrap_or_default();
++    let Some((_, tx)) = dispatch(app) else {
++        return;
++    };
++    app.compacting = true;
++    let status_id = new_message_id();
++    local::add_progress_status(
++        &mut app.view.transcript,
++        &status_id,
++        "Editing conversation context...",
++    );
++    let client = client.clone();
++    crate::work::spawn(async move {
++        let params = json!({
++            "sessionId": session_id,
++            "instructions": instructions,
++        });
++        let event = edit_event(&client, method::SESSION_CONTEXT_EDIT, params, &status_id).await;
++        let _ = tx.try_send(event);
++    });
++}
++
++/// The `session/contextEdit` reply as a command event.
++async fn edit_event(
++    client: &Arc<Client>,
++    method_name: &str,
++    params: Value,
++    status_id: &str,
++) -> CommandEvent {
++    match client.request(method_name, params).await {
++        Ok(result) => {
++            let changed = result.get("changed").and_then(Value::as_bool).unwrap_or(false);
++            let summary = edit_summary(&result);
++            if !changed {
++                return CommandEvent::ContextUnchanged {
++                    status_id: status_id.to_owned(),
++                    summary,
++                };
++            }
++            match result.get("state").cloned().and_then(|state| {
++                serde_json::from_value::<PublicSessionState>(state).ok()
++            }) {
++                Some(state) => CommandEvent::ContextEdited {
++                    state: Box::new(state),
++                    summary,
++                    status_id: status_id.to_owned(),
++                },
++                None => CommandEvent::ContextEditError {
++                    status_id: status_id.to_owned(),
++                    error: "The edit returned no state.".to_owned(),
++                },
++            }
++        }
++        Err(error) => CommandEvent::ContextEditError {
++            status_id: status_id.to_owned(),
++            error: error.to_string(),
++        },
++    }
++}
++
++/// The one-line report of the edits the editor model's reply carried: counts
++/// of replaced, masked, and removed snippets, or the all-clear when nothing
++/// needed changing.
++fn edit_summary(result: &Value) -> String {
++    let (mut replaced, mut masked, mut removed) = (0usize, 0usize, 0usize);
++    if let Some(edits) = result.get("edits").and_then(Value::as_array) {
++        for edit in edits {
++            match edit.get("operation").and_then(Value::as_str) {
++                Some("replace") => replaced += 1,
++                Some("mask") => masked += 1,
++                Some("remove") => removed += 1,
++                _ => {}
++            }
++        }
++    }
++    if replaced == 0 && masked == 0 && removed == 0 {
++        return "No text needed edits; the conversation is unchanged.".to_owned();
++    }
++    format!("{replaced} snippet(s) replaced, {masked} snippet(s) masked, {removed} snippet(s) removed.")
++}
++
++/// Apply a successful `session/contextEdit` response: rebuild every row from
++/// the returned history, like a rewind that revises wording in place.
++pub fn apply_context_edited(app: &mut App, state: PublicSessionState, summary: &str) {
++    settle_compact(app);
++    app.set_session_id(state.session.id);
++    // The edited turns are replaced wholesale, so no `/retry` offer survives.
++    crate::commands::retry::cancel(app);
++    app.view.transcript.clear();
++    crate::goal::adopt(app, state.session.goal.clone(), false);
++    crate::worktree::adopt_state(app, &state);
++    crate::background_work::adopt_state(app, &state);
++    crate::loops::adopt_state(app, &state);
++    app.view.transcript.load_snapshot(&state);
++    app.subagents.seed_snapshot(state.child_sessions);
++    crate::subagents::refresh(app);
++    app.expand_rebuilt_tools();
++    local::add_command_result(&mut app.view.transcript, &new_message_id(), summary);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn reply(changed: bool, edits: Value) -> Value {
++        json!({
++            "eventId": 0,
++            "changed": changed,
++            "edits": edits,
++            "session": {"id": "session"},
++            "childSessions": [],
++        })
++    }
++
++    #[test]
++    fn edit_summary_counts_replacements_masks_and_removals() {
++        let result = reply(
++            true,
++            json!([
++                {"message_index": 0, "operation": "replace", "original_text": "a", "replacement_text": "b"},
++                {"message_index": 1, "operation": "replace", "original_text": "c", "replacement_text": "d"},
++                {"message_index": 2, "operation": "mask", "original_text": "e", "replacement_text": "[masked]"},
++                {"message_index": 3, "operation": "remove", "original_text": "f"},
++            ]),
++        );
++        assert_eq!(
++            edit_summary(&result),
++            "2 snippet(s) replaced, 1 snippet(s) masked, 1 snippet(s) removed."
++        );
++    }
++
++    #[test]
++    fn edit_summary_reports_an_unchanged_conversation() {
++        let result = reply(false, json!([]));
++        assert_eq!(
++            edit_summary(&result),
++            "No text needed edits; the conversation is unchanged."
++        );
++    }
++
++    #[test]
++    fn edit_summary_skips_unknown_operations() {
++        let result = reply(
++            true,
++            json!([{"message_index": 0, "operation": "rewrite", "original_text": "a"}]),
++        );
++        assert_eq!(
++            edit_summary(&result),
++            "No text needed edits; the conversation is unchanged."
++        );
++    }
++}
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/commands/dispatch.rs /home/user/mistral-vibe/vibe/cli-rust/src/commands/dispatch.rs
+--- /tmp/pristine/vibe/cli-rust/src/commands/dispatch.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/commands/dispatch.rs	2026-11-21 15:59:55.358116819 +0000
+@@ -54,6 +54,7 @@
+         "/help" => add_text(app, &help_text(app)),
+         "/clear" | "/new" | "/clean" => clear_history(app, client, value),
+         "/compact" => super::compact::start_compact(app, client, value),
++        "/context-edit" => super::context_edit::start_context_edit(app, client, value),
+         "/copy" => copy_last_agent_message(app),
+         "/raw" => super::raw::command(app, command_args(value)),
+         "/paste-image" => paste_image::request(app, true),
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/commands/event.rs /home/user/mistral-vibe/vibe/cli-rust/src/commands/event.rs
+--- /tmp/pristine/vibe/cli-rust/src/commands/event.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/commands/event.rs	2026-11-21 15:59:55.359116819 +0000
+@@ -88,6 +88,22 @@
+         status_id: String,
+         error: String,
+     },
++    /// `session/contextEdit` rewrote messages; rebuild like a rewind.
++    ContextEdited {
++        state: Box<crate::server::PublicSessionState>,
++        summary: String,
++        status_id: String,
++    },
++    /// `session/contextEdit` found nothing to change; the history stands.
++    ContextUnchanged {
++        status_id: String,
++        summary: String,
++    },
++    /// `session/contextEdit` failed; settle the status in place.
++    ContextEditError {
++        status_id: String,
++        error: String,
++    },
+     /// The injected `/retry` `turn/start` was accepted; busy state clears via `turn/completed`.
+     RetryStarted,
+     /// The `/retry` `turn/start` failed; clear the busy state and mount the error.
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/commands/mod.rs /home/user/mistral-vibe/vibe/cli-rust/src/commands/mod.rs
+--- /tmp/pristine/vibe/cli-rust/src/commands/mod.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/commands/mod.rs	2026-11-21 15:59:55.360116819 +0000
+@@ -6,6 +6,7 @@
+ #[allow(clippy::module_inception)]
+ mod commands;
+ pub mod compact;
++pub mod context_edit;
+ mod dispatch;
+ pub mod event;
+ pub mod leanstall;
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/event_loop/helpers.rs /home/user/mistral-vibe/vibe/cli-rust/src/event_loop/helpers.rs
+--- /tmp/pristine/vibe/cli-rust/src/event_loop/helpers.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/event_loop/helpers.rs	2026-11-21 15:59:55.361116819 +0000
+@@ -113,6 +113,21 @@
+             crate::commands::compact::settle_compact(app);
+             local::settle_compact_status(&mut app.view.transcript, &status_id, Some(&error));
+         }
++        CommandEvent::ContextEdited { state, summary, status_id } => {
++            crate::commands::context_edit::apply_context_edited(app, *state, &summary);
++            local::settle_status(&mut app.view.transcript, &status_id, "Context edited.");
++        }
++        CommandEvent::ContextUnchanged { status_id, summary } => {
++            // The history stands; only the busy state and the status row move.
++            crate::commands::compact::settle_compact(app);
++            local::settle_status(&mut app.view.transcript, &status_id, &summary);
++        }
++        CommandEvent::ContextEditError { status_id, error } => {
++            // A failed edit leaves the stored history untouched.
++            crate::commands::compact::settle_compact(app);
++            let msg = crate::utils::text::bounded_message(&error);
++            local::settle_status(&mut app.view.transcript, &status_id, &format!("Error: {msg}"));
++        }
+         CommandEvent::RetryStarted => {}
+         CommandEvent::RetryFailed { error } => {
+             // No turn/completed will arrive; clear the busy state.
+diff -ruN '--exclude=__pycache__' -x '*.pyc' /tmp/pristine/vibe/cli-rust/src/server/types.rs /home/user/mistral-vibe/vibe/cli-rust/src/server/types.rs
+--- /tmp/pristine/vibe/cli-rust/src/server/types.rs	2026-11-20 17:38:20.000000000 +0000
++++ /home/user/mistral-vibe/vibe/cli-rust/src/server/types.rs	2026-11-21 15:59:55.362116819 +0000
+@@ -80,6 +80,8 @@
+     pub const TURN_INTERRUPT: &str = "turn/interrupt";
+     /// Compact conversation history by summarizing.
+     pub const SESSION_COMPACT: &str = "session/compact";
++    /// Rewrite the stored history messages an editor model edited (`/context-edit`).
++    pub const SESSION_CONTEXT_EDIT: &str = "session/contextEdit";
+     /// Run or interrupt a user-entered `!` command.
+     pub const SESSION_SHELL_COMMAND: &str = "session/shellCommand";
+     /// Read the config field views the `/config` settings screen renders.

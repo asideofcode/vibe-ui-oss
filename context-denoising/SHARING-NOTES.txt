@@ -1,0 +1,27 @@
+CONTEXT DENOISING — SHAREABLE SOURCE
+
+This archive includes the current patched Mistral Vibe source and the source
+for the 30-second concept video.
+
+APP
+  cd mistral-vibe
+  uv sync
+  make run
+
+Requires uv and the Rust toolchain specified in rust-toolchain.toml.
+Sign in using your own Mistral account or API key.
+Inside the chat, use:
+  /context-denoising <what you want changed>
+
+The command edits the latest saved conversation, including previous edits.
+/context-edit remains a compatibility alias. See HOW_TO_TEST.md for details.
+
+VIDEO SOURCE
+  cd video-source
+  uv run --no-project --with imageio-ffmpeg --with pillow --with numpy python render_video.py
+
+The video renderer uses macOS fonts and the built-in Daniel voice via `say`,
+so its current version requires macOS. It creates a narrated 1080p MP4.
+
+Virtual environments, compiled binaries, build caches, credentials, session
+logs, and generated video intermediates are omitted.

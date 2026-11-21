@@ -1,0 +1,65 @@
+[
+  {
+    "start": 0,
+    "end": 3,
+    "label": "CONTEXT DENOISING",
+    "title": "One assumption.\nEvery next reply.",
+    "detail": "A small drift can become\na persistent constraint.",
+    "caption": "One assumption can steer a whole conversation.",
+    "voice": "One assumption can steer a whole conversation."
+  },
+  {
+    "start": 3,
+    "end": 8,
+    "label": "01  /  THE BRIEF",
+    "title": "The user\nsets the goal.",
+    "detail": "An autonomous industry monitor.\nNo hosting requirement.",
+    "caption": "Abhinav wants a system that monitors industry channels and recommends the next best action.",
+    "voice": "Abhinav wants a system that monitors industry channels and recommends the next best action."
+  },
+  {
+    "start": 8,
+    "end": 13,
+    "label": "02  /  THE DRIFT",
+    "title": "An assumption\nslips in.",
+    "detail": "\u201cDeploy locally\u201d becomes\na requirement. It was never asked for.",
+    "caption": "The assistant adds local deployment. But that requirement was never in the brief.",
+    "voice": "The assistant adds local deployment. But that requirement was never in the brief."
+  },
+  {
+    "start": 13,
+    "end": 18,
+    "label": "03  /  NAME THE NOISE",
+    "title": "Describe\nwhat went wrong.",
+    "detail": "A targeted command\nfor a targeted correction.",
+    "caption": "With context denoising, he names the problem: remove the local deployment assumption.",
+    "voice": "With context denoising, he names the problem: remove the local deployment assumption."
+  },
+  {
+    "start": 18,
+    "end": 23.5,
+    "label": "04  /  REPAIR THE HISTORY",
+    "title": "Update the past.\nImprove the\nnext reply.",
+    "detail": "The saved messages change.\nThe conversation stays intact.",
+    "caption": "The saved history is updated. Each new pass builds on those edits.",
+    "voice": "The saved history is updated. Each new pass builds on those edits."
+  },
+  {
+    "start": 23.5,
+    "end": 27,
+    "label": "05  /  KEEP GOING",
+    "title": "Continue from\ncleaner context.",
+    "detail": "Keep the useful details.\nDrop the invented constraint.",
+    "caption": "Now the chat continues, without that invented constraint.",
+    "voice": "Now the chat continues, without that invented constraint."
+  },
+  {
+    "start": 27,
+    "end": 30,
+    "label": "CONTEXT DENOISING",
+    "title": "Denoise the context.\nKeep the conversation.",
+    "detail": "",
+    "caption": "Cleaner context. Better next replies.",
+    "voice": "Cleaner context. Better next replies."
+  }
+]

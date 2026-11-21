@@ -1,0 +1,27 @@
+1
+00:00:00,000 --> 00:00:03,000
+One assumption can steer a whole conversation.
+
+2
+00:00:03,000 --> 00:00:08,000
+Abhinav wants a system that monitors industry channels and recommends the next best action.
+
+3
+00:00:08,000 --> 00:00:13,000
+The assistant adds local deployment. But that requirement was never in the brief.
+
+4
+00:00:13,000 --> 00:00:18,000
+With context denoising, he names the problem: remove the local deployment assumption.
+
+5
+00:00:18,000 --> 00:00:23,500
+The saved history is updated. Each new pass builds on those edits.
+
+6
+00:00:23,500 --> 00:00:27,000
+Now the chat continues, without that invented constraint.
+
+7
+00:00:27,000 --> 00:00:30,000
+Cleaner context. Better next replies.
