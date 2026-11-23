@@ -1,6 +1,0 @@
-[
- {
-  "method": "session/lease/subscribe",
-  "params": {}
- }
-]
